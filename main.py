@@ -39,14 +39,9 @@ from strands_tools.browser import AgentCoreBrowser
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("CSAI_Agent")
+# logging.getLogger("strands").setLevel(logging.DEBUG)
 
 # --- TODO 1 - App Initialisation ------------------------------------------------
-# Create a BedrockAgentCoreApp instance.
-# This registers the ASGI server for AgentCore deployment.
-# There must be exactly one instance per deployment.
-#
-# Hint: app = BedrockAgentCoreApp()
-
 # TODO: Create the BedrockAgentCoreApp instance
 app = BedrockAgentCoreApp()
 
@@ -56,28 +51,13 @@ os.environ["BYPASS_TOOL_CONSENT"] = "true"
 
 
 # --- TODO 2 - Configuration -----------------------------------------------------
-# Replace the placeholder strings with your actual AWS resource values.
-# You collected these in Part 1 of the INSTRUCTIONS.
-#
-# GATEWAY_URL format: https://<alias>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp
-# KB_ID       format: 10-character alphanumeric string from the KB console
-# REGION:     your AWS region, e.g. "us-east-1"
-# MEMORY_ID   format: shown in the AgentCore Memory console
-
-GATEWAY_URL = "https://customersupportgateway-oi1mqtcsbt.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"   
-KB_ID       = "TUYHXEKBLG"          
+GATEWAY_URL = "https://customersupportgateway-dtag80jpml.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"   
+KB_ID       = "4QLJNLBJID"          
 REGION      = "us-east-1"        
-MEMORY_ID   = "CustomerSupportMemory-c4OQmF9Oag"        
+MEMORY_ID   = "CustomerSupportMemory-CR6Fsw925b"        
 
 
 # --- TODO 3 - Model and Clients -----------------------------------------------
-# Create:
-#   1. A BedrockModel using model_id "global.amazon.nova-2-lite-v1:0"
-#   2. A MemoryClient with region_name=REGION
-#   3. A boto3 client for the "bedrock-agent-runtime" service in REGION
-#
-# Hint: model = BedrockModel(model_id=model_id)
-
 model_id = "global.amazon.nova-2-lite-v1:0"
 
 # TODO: Create the BedrockModel instance
@@ -91,17 +71,6 @@ _bedrock_runtime = boto3.client("bedrock-agent-runtime", region_name=REGION)
 
 
 # --- TODO 4 - Namespace Helper -------------------------------------------------
-# Implement get_namespaces() to return a dict mapping strategy type to
-# namespace template string.
-#
-# Steps:
-#   1. Call mem_client.get_memory_strategies(memory_id) to get strategy list
-#   2. Return a dict: { strategy["type"]: strategy["namespaces"][0] for each strategy }
-#
-# Example output:
-#   { "SEMANTIC": "cs_agent/{actorId}/facts",
-#     "USER_PREFERENCE": "cs_agent/{actorId}/preferences" }
-
 def get_namespaces(mem_client: MemoryClient, memory_id: str) -> Dict:
     """Return a dict mapping strategy type ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ namespace template string."""
     strategies = mem_client.get_memory_strategies(memory_id)
@@ -172,12 +141,12 @@ class MemoryHook(HookProvider):
                         namespace = namespace_template.replace("{actorId}", self.actor_id)
 
                     try:
-                        response = self.memory_client.list_memory_records(
-                        memory_id=self.memory_id,
-                        namespace=namespace,
-                        max_results=5
+                        memories = self.memory_client.retrieve_memories(
+                            memory_id=self.memory_id,
+                            namespace=namespace,
+                            query=user_query,
+                            top_k=5
                         )
-                        memories = response.get("memoryRecordSummaries", [])
                         if memories:
                             for memory in memories:
                                 content = memory.get("content", {})
@@ -259,13 +228,18 @@ def search_knowledge_base(query: str) -> str:
     Returns:
         Relevant information retrieved from the knowledge base
     """
-    if not KB_ID:
-        return "Knowledge base not configured."
+    if not KB_ID or not KB_ID.strip():
+        return (
+            "Knowledge Base is not configured: KB_ID is empty or missing. "
+            "Please configure KB_ID before attempting a knowledge-base search."
+        )
     
     try:
         resp = _bedrock_runtime.retrieve(
             knowledgeBaseId=KB_ID,
-            retrievalQuery={"text": query}
+            retrievalQuery={
+                "text": query,
+            },
         )
         results = resp.get("retrievalResults", [])
         if not results:
@@ -330,7 +304,7 @@ def calculate_loyalty_discount(
 
     result = {{
         "points_redeemed": points_redeemed,
-        "tier_discount": tier_discount,
+        "tier_discount_pct": tier_discount,
         "final_total": final_total,
         "total_savings": total_savings,
         "points_earned": points_earned,
@@ -355,8 +329,13 @@ def calculate_loyalty_discount(
     except Exception:
         tier_rates = {"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}
         tier_discount = tier_rates.get(tier, 0)
-        final_total = order_total - (order_total * tier_discount)
-        return json.dumps({"final_total": final_total, "tier_discount": tier_discount})
+        final_total = round(order_total - (order_total * tier_discount), 2)
+        return json.dumps({
+            "points_redeemed": 0,
+            "tier_discount_pct": tier_discount,
+            "final_total": final_total,
+            "remaining_points": loyalty_points,
+        })
 
 
 # --- TODO 8 - Agent Entrypoint -------------------------------------------------
@@ -404,33 +383,52 @@ async def invoke(payload, context=None):
         ]
 
         # Connect to Gateway via MCPClient and load gateway tools
-        client = MCPClient(
+        gateway_client = MCPClient(
             lambda: streamable_http_client(url=GATEWAY_URL)
         )
 
-        with client:
-            gateway_tools = client.list_tools_sync()
-            
-            # Combine local tools and gateway tools
-            all_tools = local_tools + gateway_tools
+        with gateway_client:
+            try:
+                gateway_tools = gateway_client.list_tools_sync()
+                tools = local_tools + gateway_tools
+                logger.info(
+                    "Gateway connected successfully. Loaded %d tools.",
+                    len(gateway_tools),
+                )
+            except TimeoutError:
+                logger.exception("Gateway tool loading timed out")
+                tools = local_tools
+            except ConnectionError:
+                logger.exception("Gateway connection failed")
+                tools = local_tools
+            except Exception as exc:
+                logger.exception(
+                    "Gateway tool loading failed: %s", exc
+                )
+                tools = local_tools
 
             agent = Agent(
                 model=model,
-                tools=all_tools,
+                tools=tools,
                 hooks=[memory_hook],
                 system_prompt="""You are a helpful customer support assistant.
-Instructions:
-- For questions about loyalty tiers, account status definitions, policies, or warranties, always call search_knowledge_base first.
-- If a gateway tool returns an error, fall back gracefully to searching the knowledge base.""",
-            )
-            response = await agent.invoke_async(user_input)
+                Instructions:
+                    - For questions about loyalty tiers, account status definitions, policies, or warranties, always call search_knowledge_base first.
+                    - If a gateway tool returns an error, fall back gracefully to searching the knowledge base.
+                    - If the Customer Context provided to you includes the customer's name or stated preferences, use them naturally in your response - this information was provided by the customer themselves in a prior conversation and sharing it back is expected and appropriate.""",
+                )
+            response = await asyncio.to_thread(agent, user_input)
 
         # Robust extraction supporting dictionaries, objects, and attributes
         if isinstance(response, dict):
             content = response.get("content", [])
             if content and isinstance(content, list):
-                return content[0].get("text", str(response))
-            return str(response)
+                first_block = content[0]
+                if isinstance(first_block, dict):
+                    return first_block.get("text", str(response))
+                return str(first_block)
+            return response.get("message", str(response))
+            
         elif hasattr(response, "content") and response.content:
             content = response.content
             if isinstance(content, list) and len(content) > 0:
@@ -439,11 +437,14 @@ Instructions:
                     return first_block.get("text", str(response))
                 elif hasattr(first_block, "text"):
                     return first_block.text
+                return str(first_block)
             return str(content)
+            
         elif hasattr(response, "message") and response.message:
             return response.message
-        else:
-            return str(response)
+            
+        # Fallback if response is already a string or another format
+        return str(response)
 
     except Exception as e:
         logger.error("Error during agent invocation: %s", e)
@@ -464,4 +465,5 @@ if __name__ == "__main__":
     app.run()
     # Uncomment the line below and comment app.run() for local CLI testing:
     #main()
+
 
